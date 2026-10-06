@@ -1,0 +1,70 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:   # позволяет запускать сборку вручную из вкладки Actions
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Проект использует очень свежий тулчейн (AGP 9.1.1, Kotlin 2.2.10, compileSdk 36),
+      # поэтому берём JDK 21 (AGP 9 требует JDK 17+).
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Устанавливает Android SDK (cmdline-tools, platform-tools) и кладёт на PATH.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Нужные платформа и build-tools под compileSdk/targetSdk 36.
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      # В архиве нет кастомного debug.keystore, на который завязан debugConfig.
+      # Генерируем стандартный debug-keystore с теми же alias/паролями, что в build.gradle.kts.
+      - name: Create debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      # Плагин secrets ждёт .env (fallback на .env.example уже есть, но создаём явно).
+      - name: Prepare .env
+        run: cp .env.example .env
+
+      # Устанавливает конкретную версию Gradle и кладёт её на PATH (в репозитории нет gradlew).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+
+      # Генерируем Gradle wrapper, т.к. его нет в проекте.
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 9.1.0
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
