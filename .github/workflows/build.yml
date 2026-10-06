@@ -25,14 +25,14 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # Устанавливает Android SDK (cmdline-tools, platform-tools) и кладёт на PATH.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # Нужные платформа и build-tools под compileSdk/targetSdk 36.
-      - name: Install SDK packages
+      - name: Accept licenses and install SDK packages
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          yes | sdkmanager --licenses || true
+          sdkmanager --update
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       # В архиве нет кастомного debug.keystore, на который завязан debugConfig.
       # Генерируем стандартный debug-keystore с теми же alias/паролями, что в build.gradle.kts.
