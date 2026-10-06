@@ -49,8 +49,7 @@ jobs:
 
       # Плагин secrets ждёт .env (fallback на .env.example уже есть, но создаём явно).
       - name: Prepare .env
-        run: cp .env.example .env
-
+        run: echo "GEMINI_API_KEY=MY_GEMINI_API_KEY" > .env
       # Устанавливает конкретную версию Gradle и кладёт её на PATH (в репозитории нет gradlew).
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
