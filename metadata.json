@@ -1,0 +1,6 @@
+{
+  "name": "Vizit Cloner Tool",
+  "description": "Professional NFC cloner tool for MIFARE ULTRALIGHT EV1 and NTAG tags with fully editable dumps, history, and raw hex log console.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
