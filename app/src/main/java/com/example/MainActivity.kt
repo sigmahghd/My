@@ -511,6 +511,36 @@ fun ClonerScreen(
         var customKeyText by remember { mutableStateOf(uiState.passwordHex) }
         var errorText by remember { mutableStateOf("") }
         val uidVal = uiState.uid
+        val hasRealUid = uidVal.isNotEmpty() && uidVal != "00000000000000"
+
+        // Build the option lists declaratively here (in @Composable scope, where
+        // remember is valid) — not inside the LazyColumn's LazyListScope lambda.
+        val keyOptions = remember(uidVal, hasRealUid) {
+            listOf(
+                KeyOption("00000000", "КРИПТОКЛЮЧА НЕТ (отключить авторизацию)", "00000000"),
+                KeyOption("FFFFFFFF", "Заводской по умолчанию", "FFFFFFFF"),
+                KeyOption("4E457854", "NExT импланты / чипы", "4E457854"),
+                KeyOption("B6AA558D", "Copykey заготовки", "B6AA558D")
+            )
+        }
+        val generatorOptions = remember(uidVal, hasRealUid) {
+            listOf(
+                Triple("EV1/NTAG XOR алгоритм", "Расчет: ", if (hasRealUid) PwdGenerator.generateDefaultXor(uidVal) else "—"),
+                Triple("SALTO Systems (A)", "Расчет: ", if (hasRealUid) PwdGenerator.generateSalto(uidVal) else "—"),
+                Triple("Amiibo (B)", "Расчет: ", if (hasRealUid) PwdGenerator.generateAmiibo(uidVal) else "—"),
+                Triple("Lego Dimensions (C)", "Расчет: ", if (hasRealUid) PwdGenerator.generateLego(uidVal) else "—"),
+                Triple("Xiaomi Air Purifier (E)", "Расчет: ", if (hasRealUid) PwdGenerator.generateXiaomi(uidVal) else "—"),
+                Triple("NDEF Tools MD5 (F)", "Расчет: ", if (hasRealUid) PwdGenerator.generateNdef(uidVal) else "—")
+            ).map { (title, prefix, calc) ->
+                KeyOption(
+                    title = title,
+                    subtitle = "$prefix$calc",
+                    value = if (hasRealUid) calc else null,
+                    isGenerator = true,
+                    enabled = hasRealUid
+                )
+            }
+        }
 
         AlertDialog(
             onDismissRequest = { showKeyConfigDialog = false },
@@ -577,34 +607,6 @@ fun ClonerScreen(
                                 color = Color.Red,
                                 fontSize = 11.sp,
                                 modifier = Modifier.padding(top = 4.dp)
-                            )
-                        }
-                    }
-
-                    // Build the full option list declaratively (presets + UID generators).
-                    val keyOptions = remember(uidVal, hasRealUid) {
-                        val list = mutableListOf<KeyOption>()
-                        list += KeyOption("00000000", "КРИПТОКЛЮЧА НЕТ (отключить авторизацию)", "00000000")
-                        list += KeyOption("FFFFFFFF", "Заводской по умолчанию", "FFFFFFFF")
-                        list += KeyOption("4E457854", "NExT импланты / чипы", "4E457854")
-                        list += KeyOption("B6AA558D", "Copykey заготовки", "B6AA558D")
-                        list
-                    }
-                    val generatorOptions = remember(uidVal, hasRealUid) {
-                        listOf(
-                            Triple("EV1/NTAG XOR алгоритм", "Расчет: ", if (hasRealUid) PwdGenerator.generateDefaultXor(uidVal) else "—"),
-                            Triple("SALTO Systems (A)", "Расчет: ", if (hasRealUid) PwdGenerator.generateSalto(uidVal) else "—"),
-                            Triple("Amiibo (B)", "Расчет: ", if (hasRealUid) PwdGenerator.generateAmiibo(uidVal) else "—"),
-                            Triple("Lego Dimensions (C)", "Расчет: ", if (hasRealUid) PwdGenerator.generateLego(uidVal) else "—"),
-                            Triple("Xiaomi Air Purifier (E)", "Расчет: ", if (hasRealUid) PwdGenerator.generateXiaomi(uidVal) else "—"),
-                            Triple("NDEF Tools MD5 (F)", "Расчет: ", if (hasRealUid) PwdGenerator.generateNdef(uidVal) else "—")
-                        ).map { (title, prefix, calc) ->
-                            KeyOption(
-                                title = title,
-                                subtitle = "$prefix$calc",
-                                value = if (hasRealUid) calc else null,
-                                isGenerator = true,
-                                enabled = hasRealUid
                             )
                         }
                     }
