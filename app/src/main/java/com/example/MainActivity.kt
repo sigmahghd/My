@@ -107,6 +107,7 @@ import com.example.ui.viewmodel.AppMode
 import com.example.ui.viewmodel.ScanViewModel
 import com.example.ui.viewmodel.PwdGenerator
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -132,8 +133,12 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            val uiState by viewModel.uiState.collectAsState()
-            val isDarkTheme = uiState.isDarkTheme
+            // Collect only the theme flag so changing any other state field does not
+            // recompose the whole Scaffold/ClonerScreen tree.
+            val themeFlow = remember(viewModel) {
+                viewModel.uiState.map { it.isDarkTheme }.distinctUntilChanged()
+            }
+            val isDarkTheme by themeFlow.collectAsState(initial = viewModel.uiState.value.isDarkTheme)
 
             MyApplicationTheme(darkTheme = isDarkTheme) {
                 Scaffold(
@@ -219,6 +224,8 @@ fun ClonerScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val history by viewModel.historyScans.collectAsState()
+    val logs by viewModel.logs.collectAsState()
+    val operation by viewModel.operation.collectAsState()
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val contentResolver = context.contentResolver
@@ -255,7 +262,7 @@ fun ClonerScreen(
         }
         StablePages(list)
     }
-    val stableLogs = remember(uiState.logs) { StableLogs(uiState.logs) }
+    val stableLogs = remember(logs) { StableLogs(logs) }
 
     var editingPage by remember { mutableStateOf<Int?>(null) }
     var showHistoryScreen by remember { mutableStateOf(false) }
@@ -314,8 +321,8 @@ fun ClonerScreen(
                 uid = uiState.uid,
                 mode = uiState.mode,
                 onSetMode = onSetModeRemember,
-                isOperating = uiState.isOperating,
-                operationProgress = uiState.operationProgress
+                isOperating = operation.isOperating,
+                operationProgress = operation.progress
             )
 
             // Configure Cryptokey/Password selection button/card

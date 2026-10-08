@@ -17,8 +17,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -79,12 +77,12 @@ class MifareUltralightConnection(private val mifare: MifareUltralight) : NfcTagC
 class NfcAConnection(private val nfcA: NfcA) : NfcTagConnection {
     override fun connect() = nfcA.connect()
     override fun close() = nfcA.close()
-    
+
     override fun readPages(pageOffset: Int): ByteArray {
         val command = byteArrayOf(0x30.toByte(), pageOffset.toByte())
         return nfcA.transceive(command)
     }
-    
+
     override fun writePage(pageOffset: Int, data: ByteArray) {
         require(data.size == 4) { "Mifare Ultralight page write requires exactly 4 bytes" }
         val command = ByteArray(6)
@@ -93,7 +91,7 @@ class NfcAConnection(private val nfcA: NfcA) : NfcTagConnection {
         System.arraycopy(data, 0, command, 2, 4)
         nfcA.transceive(command)
     }
-    
+
     override fun getTypeName(): String {
         val sak = nfcA.sak.toInt() and 0xFF
         val atqaBytes = nfcA.atqa
@@ -151,15 +149,19 @@ enum class AppMode {
     READ, WRITE
 }
 
+/**
+ * Transient state of a long-running read/write operation, kept in its own flow so progress
+ * ticks only recompose the progress indicator, never the whole screen or the dump list.
+ */
+data class OperationState(
+    val isOperating: Boolean = false,
+    val progress: Float = 0f
+)
+
 data class ScanUiState(
     val pages: Map<Int, String> = emptyMap(),
     val uid: String = "",
     val mode: AppMode = AppMode.READ,
-    val logs: List<String> = listOf(
-        "Журнал",
-        "Read mode: tap tag",
-        "======================"
-    ),
     val infoText: String = "Готов к сканированию",
     val tagType: String = "Неизвестно",
     val maxPages: Int = 16,
@@ -167,8 +169,6 @@ data class ScanUiState(
     val readTotalPages: String = "",
     val isDarkTheme: Boolean = false,
     val passwordHex: String = "00000000",
-    val operationProgress: Float = 0f,
-    val isOperating: Boolean = false,
     val enableLockBypass: Boolean = false,
     val writeCfgPages: Boolean = true
 )
@@ -180,6 +180,22 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(ScanUiState())
     val uiState: StateFlow<ScanUiState> = _uiState.asStateFlow()
+
+    // Logs live in their own flow. Appending a line no longer copies the whole UI state,
+    // and background NFC code can log without hopping to the main thread.
+    private val _logs = MutableStateFlow(
+        listOf(
+            "Журнал",
+            "Read mode: tap tag",
+            "======================"
+        )
+    )
+    val logs: StateFlow<List<String>> = _logs.asStateFlow()
+
+    // Operation progress/activity in its own flow (see OperationState).
+    private val _operation = MutableStateFlow(OperationState())
+    val operation: StateFlow<OperationState> = _operation.asStateFlow()
+
     private val prefs = application.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
 
     init {
@@ -227,7 +243,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun initializeEmptyDump(count: Int) {
-        val emptyMap = mutableMapOf<Int, String>()
+        val emptyMap = HashMap<Int, String>(count)
         for (i in 0 until count) {
             emptyMap[i] = "00000000"
         }
@@ -249,21 +265,11 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setMode(mode: AppMode) {
-        _uiState.update { state ->
-            val cleanLogs = mutableListOf<String>()
-            cleanLogs.add("Журнал")
-            if (mode == AppMode.READ) {
-                cleanLogs.add("Read mode: tap tag")
-            } else {
-                cleanLogs.add("Write mode: tap tag")
-            }
-            cleanLogs.add("======================")
-            state.copy(
-                mode = mode,
-                logs = cleanLogs,
-                readTotalPages = ""
-            )
-        }
+        val cleanLogs = mutableListOf("Журнал")
+        cleanLogs.add(if (mode == AppMode.READ) "Read mode: tap tag" else "Write mode: tap tag")
+        cleanLogs.add("======================")
+        _logs.value = cleanLogs
+        _uiState.update { it.copy(mode = mode, readTotalPages = "") }
     }
 
     fun toggleWriteSystemPages(enable: Boolean) {
@@ -276,30 +282,30 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         // Validation: Must be up to 8 hex chars
         val cleaned = hexData.uppercase(Locale.ROOT).filter { it in "0123456789ABCDEF" }
         val finalHex = cleaned.take(8).padEnd(8, '0')
-        
+
         _uiState.update { state ->
             val updatedPages = state.pages.toMutableMap()
             updatedPages[pageIndex] = finalHex
-            
+
             // Auto BCC Recalculation
             try {
                 if (pageIndex == 0 || pageIndex == 1) {
                     val p0 = updatedPages[0]?.let { hexToBytes(it) } ?: byteArrayOf(0, 0, 0, 0)
                     val p1 = updatedPages[1]?.let { hexToBytes(it) } ?: byteArrayOf(0, 0, 0, 0)
                     val p2 = updatedPages[2]?.let { hexToBytes(it) } ?: byteArrayOf(0, 0, 0, 0)
-                    
+
                     // Recalculate BCC0 (page 0 byte 3)
                     val bcc0 = (0x88.toByte().toInt() xor p0[0].toInt() xor p0[1].toInt() xor p0[2].toInt()).toByte()
                     p0[3] = bcc0
                     updatedPages[0] = bytesToHex(p0)
-                    
+
                     // Recalculate BCC1 (page 2 byte 0)
                     val bcc1 = (p1[0].toInt() xor p1[1].toInt() xor p1[2].toInt() xor p1[3].toInt()).toByte()
                     p2[0] = bcc1
                     updatedPages[2] = bytesToHex(p2)
                 }
             } catch (_: Exception) {}
-            
+
             state.copy(pages = updatedPages)
         }
     }
@@ -321,7 +327,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        
+
         val actualCount = maxIdx + 1
         _uiState.update { state ->
             state.copy(
@@ -332,7 +338,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 readTotalPages = "Загружено из истории: $actualCount стр."
             )
         }
-        
+
         log("Загружен дамп из истории:")
         log("UID: ${scan.uid}")
         log("Спецификация: ${scan.tagType}")
@@ -349,9 +355,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 repository.deleteScanById(id)
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    log("Ошибка удаления: ${e.localizedMessage}")
-                }
+                log("Ошибка удаления: ${e.localizedMessage}")
             }
         }
     }
@@ -360,32 +364,52 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 repository.clearHistory()
-                withContext(Dispatchers.Main) {
-                    log("История очищена.")
-                }
+                log("История очищена.")
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    log("Ошибка очистки истории: ${e.localizedMessage}")
-                }
+                log("Ошибка очистки истории: ${e.localizedMessage}")
             }
         }
     }
 
+    /**
+     * Thread-safe log append. Safe to call from any dispatcher; the UI collects [logs] on main.
+     * Caps history at 200 lines (trimmed to the latest 150 plus the header) to avoid bloat.
+     */
     fun log(message: String) {
-        _uiState.update { state ->
-            val list = state.logs.toMutableList()
+        _logs.update { current ->
+            val list = current.toMutableList()
             list.add(message)
-            // Prevent log size bloating by truncating to latest 150 lines, keeping the "Журнал" header
             if (list.size > 200) {
                 val header = list.firstOrNull() ?: "Журнал"
                 val truncated = list.takeLast(150).toMutableList()
                 if (truncated.firstOrNull() != header) {
                     truncated.add(0, header)
                 }
-                state.copy(logs = truncated)
+                truncated
             } else {
-                state.copy(logs = list)
+                list
             }
+        }
+    }
+
+    private fun startOperation() {
+        _operation.value = OperationState(isOperating = true, progress = 0f)
+    }
+
+    private fun finishOperation(finalProgress: Float = 1f) {
+        _operation.value = OperationState(isOperating = false, progress = finalProgress)
+    }
+
+    /**
+     * Throttled progress emit: only publishes when the whole-percent value changes (or at 100%),
+     * cutting hundreds of emissions on large tags down to at most ~100.
+     */
+    private fun emitProgress(progress: Float) {
+        val clamped = progress.coerceIn(0f, 1f)
+        val cur = _operation.value
+        if (!cur.isOperating) return
+        if ((clamped * 100).toInt() != (cur.progress * 100).toInt() || clamped >= 1f) {
+            _operation.value = cur.copy(progress = clamped)
         }
     }
 
@@ -401,7 +425,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             log("Ошибка инициализации тега: ${e.localizedMessage}")
             null
         }
-        
+
         if (connection == null) {
             log("Ошибка: Тег не поддерживает технологию NFC-A / Mifare Ultralight")
             return
@@ -418,32 +442,25 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                     performWrite(connection, uidHex)
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    log("Критическая ошибка работы с тегом: ${e.localizedMessage}")
-                }
+                log("Критическая ошибка работы с тегом: ${e.localizedMessage}")
             }
         }
     }
 
-    private suspend fun performRead(connection: NfcTagConnection, uidHex: String) {
-        _uiState.update { it.copy(isOperating = true, operationProgress = 0f) }
-        withContext(Dispatchers.Main) {
-            log("Режим: Читать")
-            log("Технология: [NfcA / MifareUltralight]")
-            log("UID (поверхностный): $uidHex")
-        }
+    private fun performRead(connection: NfcTagConnection, uidHex: String) {
+        startOperation()
+        log("Режим: Читать")
+        log("Технология: [NfcA / MifareUltralight]")
+        log("UID (поверхностный): $uidHex")
 
         val pagesMap = mutableMapOf<Int, String>()
         var successPages = 0
         var totalReadPages = 44 // default guess, will expand dynamically
-        
+
         try {
             connection.connect()
             val typeVal = connection.getTypeName()
-
-            withContext(Dispatchers.Main) {
-                log("Тип чипа: $typeVal")
-            }
+            log("Тип чипа: $typeVal")
 
             // GetVersion to determine exact specification and page sizes
             var detectedMaxPages = 44
@@ -481,14 +498,10 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                             detectedMaxPages = if (storageSize > 0) storageSize * 8 else 44
                         }
                     }
-                    withContext(Dispatchers.Main) {
-                        log("GetVersion (0x60): УСПЕШНО. Обнаружен: $detectedType ($detectedMaxPages стр.)")
-                    }
+                    log("GetVersion (0x60): УСПЕШНО. Обнаружен: $detectedType ($detectedMaxPages стр.)")
                     totalReadPages = detectedMaxPages
                 } else {
-                    withContext(Dispatchers.Main) {
-                        log("GetVersion (0x60) не поддерживается. Будем использовать автоопределение.")
-                    }
+                    log("GetVersion (0x60) не поддерживается. Будем использовать автоопределение.")
                 }
             } catch (e: Exception) {
                 // Keep default
@@ -497,18 +510,14 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             // Authentication with password (if configured)
             val pwdHex = _uiState.value.passwordHex
             if (pwdHex.isNotEmpty() && pwdHex != "00000000") {
-                withContext(Dispatchers.Main) {
-                    log("Авторизация: попытка с PWD: $pwdHex")
-                }
+                log("Авторизация: попытка с PWD: $pwdHex")
                 val pwdBytes = hexToBytes(pwdHex)
                 if (pwdBytes.size == 4) {
                     val pack = connection.authenticate(pwdBytes)
-                    withContext(Dispatchers.Main) {
-                        if (pack != null) {
-                            log("Авторизация УСПЕШНА. PACK: ${bytesToHex(pack)}")
-                        } else {
-                            log("Авторизация не пройдена или не требуется для чтения")
-                        }
+                    if (pack != null) {
+                        log("Авторизация УСПЕШНА. PACK: ${bytesToHex(pack)}")
+                    } else {
+                        log("Авторизация не пройдена или не требуется для чтения")
                     }
                 }
             }
@@ -536,7 +545,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     successPages = end + 1
                     start = end + 1
-                    _uiState.update { it.copy(operationProgress = start.toFloat() / totalReadPages) }
+                    emitProgress(start.toFloat() / totalReadPages)
                 }
             }
 
@@ -545,7 +554,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 successPages = 0
                 pagesMap.clear()
                 for (i in 0 until totalReadPages step 4) {
-                    _uiState.update { it.copy(operationProgress = i.toFloat() / totalReadPages) }
+                    emitProgress(i.toFloat() / totalReadPages)
                     try {
                         val data = connection.readPages(i)
                         if (data != null && data.size >= 16) {
@@ -564,21 +573,12 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            withContext(Dispatchers.Main) {
-                log(if (fastReadUsed) "Чтение: FAST_READ (0x3A) — ускоренный режим" else "Чтение: стандартный READ (0x30)")
-            }
+            log(if (fastReadUsed) "Чтение: FAST_READ (0x3A) — ускоренный режим" else "Чтение: стандартный READ (0x30)")
 
             // Connection is closed in the finally block to avoid a double close.
 
             if (successPages > 0) {
                 totalReadPages = successPages
-                val formattedPagesData = buildString {
-                    for (i in 0 until totalReadPages) {
-                        val pageVal = pagesMap[i] ?: "00000000"
-                        val prefix = String.format(Locale.ROOT, "%02X", i)
-                        append("$prefix : $pageVal\n")
-                    }
-                }.trim()
 
                 // Extract exact 7-byte UID from Page 0 and Page 1
                 val p0 = pagesMap[0] ?: ""
@@ -592,7 +592,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 // Save to history automatically
                 val simpleDateFormat = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
                 val itemTitle = "Дамп $exactUidHex (${simpleDateFormat.format(Date())})"
-                
+
                 val entity = ScanEntity(
                     title = itemTitle,
                     uid = exactUidHex,
@@ -606,69 +606,57 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 repository.insertScan(entity)
 
-                withContext(Dispatchers.Main) {
-                    _uiState.update { state ->
-                        state.copy(
-                            pages = pagesMap,
-                            uid = exactUidHex,
-                            maxPages = totalReadPages,
-                            tagType = entity.tagType,
-                            readTotalPages = "Read completed: $totalReadPages/$totalReadPages (100%)"
-                        )
-                    }
-                    log("Успешно считано $totalReadPages страниц")
-                    log("Реальный 7-байтный UID: $exactUidHex")
-                    log("Дамп автоматически записан в историю.")
+                _uiState.update { state ->
+                    state.copy(
+                        pages = pagesMap,
+                        uid = exactUidHex,
+                        maxPages = totalReadPages,
+                        tagType = entity.tagType,
+                        readTotalPages = "Read completed: $totalReadPages/$totalReadPages (100%)"
+                    )
                 }
+                log("Успешно считано $totalReadPages страниц")
+                log("Реальный 7-байтный UID: $exactUidHex")
+                log("Дамп автоматически записан в историю.")
             } else {
-                withContext(Dispatchers.Main) {
-                    log("Ошибка: Не удалось прочитать данные с чипа")
-                }
+                log("Ошибка: Не удалось прочитать данные с чипа")
             }
 
         } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                log("Ошибка подключения к чипу: ${e.localizedMessage}")
-            }
+            log("Ошибка подключения к чипу: ${e.localizedMessage}")
         } finally {
-            _uiState.update { it.copy(isOperating = false, operationProgress = 1.0f) }
+            finishOperation()
             try {
                 connection.close()
             } catch (ignored: Exception) {}
         }
     }
 
-    private suspend fun performWrite(connection: NfcTagConnection, uidHex: String) {
+    private fun performWrite(connection: NfcTagConnection, uidHex: String) {
         val state = _uiState.value
         val pagesToWrite = state.pages
         val writeSystem = state.writeSystemPages
 
-        _uiState.update { it.copy(isOperating = true, operationProgress = 0f) }
+        startOperation()
 
-        withContext(Dispatchers.Main) {
-            log("Режим: Запись")
-            log("Телеметрия чипа перед записью...")
-            log("UID цели: $uidHex")
-        }
+        log("Режим: Запись")
+        log("Телеметрия чипа перед записью...")
+        log("UID цели: $uidHex")
 
         try {
             connection.connect()
-            
+
             // Authentication with password (if configured)
             val pwdHex = state.passwordHex
             if (pwdHex.isNotEmpty() && pwdHex != "00000000") {
-                withContext(Dispatchers.Main) {
-                    log("Авторизация: попытка с PWD: $pwdHex")
-                }
+                log("Авторизация: попытка с PWD: $pwdHex")
                 val pwdBytes = hexToBytes(pwdHex)
                 if (pwdBytes.size == 4) {
                     val pack = connection.authenticate(pwdBytes)
-                    withContext(Dispatchers.Main) {
-                        if (pack != null) {
-                            log("Авторизация УСПЕШНА. PACK: ${bytesToHex(pack)}")
-                        } else {
-                            log("Вызов PWD авторизации перед записью...")
-                        }
+                    if (pack != null) {
+                        log("Авторизация УСПЕШНА. PACK: ${bytesToHex(pack)}")
+                    } else {
+                        log("Вызов PWD авторизации перед записью...")
                     }
                 }
             }
@@ -676,10 +664,8 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             // Start writing page by page
             val startPage = if (writeSystem) 0 else 4
             val endPage = state.maxPages
-            
-            withContext(Dispatchers.Main) {
-                log("Спектр записи: стр. $startPage - ${endPage - 1}")
-            }
+
+            log("Спектр записи: стр. $startPage - ${endPage - 1}")
 
             // Lock-Bait Bypass detection & implementation (for pages 4-6) if enabled
             var originalPage2Bytes: ByteArray? = null
@@ -692,9 +678,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                         originalPage2Bytes = page2Data.sliceArray(8..11)
                     }
                 } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        log("Внимание: оригинальная стр.02 не прочитана: ${e.localizedMessage}")
-                    }
+                    log("Внимание: оригинальная стр.02 не прочитана: ${e.localizedMessage}")
                 }
 
                 hasLockBypass = (originalPage2Bytes != null)
@@ -703,20 +687,14 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                         // 1. Wakeup
                         val wOk = connection.magicWakeup()
                         if (wOk) {
-                            withContext(Dispatchers.Main) {
-                                log("Magic Wakeup: УСПЕШНО")
-                            }
+                            log("Magic Wakeup: УСПЕШНО")
                         }
                         // 2. Write page 2 with bypass: 00 00, bytes 2-3
                         val bypass02 = byteArrayOf(0x00, 0x00, originalPage2Bytes!![2], originalPage2Bytes!![3])
                         connection.writePage(2, bypass02)
-                        withContext(Dispatchers.Main) {
-                            log("Lock-Bait обход: блокировка временно снята")
-                        }
+                        log("Lock-Bait обход: блокировка временно снята")
                     } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            log("Ошибка Lock-Bait обхода: ${e.localizedMessage}")
-                        }
+                        log("Ошибка Lock-Bait обхода: ${e.localizedMessage}")
                     }
                 }
             }
@@ -725,9 +703,9 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
             val totalToWrite = endPage - startPage
             // Track pages we actually wrote and the exact bytes intended, for post-write verification.
             val writtenPages = LinkedHashMap<Int, ByteArray>()
-            
+
             for (pageIdx in startPage until endPage) {
-                _uiState.update { it.copy(operationProgress = (pageIdx - startPage).toFloat() / totalToWrite) }
+                emitProgress((pageIdx - startPage).toFloat() / totalToWrite)
 
                 // Check if we should skip configuration/password pages 0x29, 0x2A, 0x2B (41, 42, 43 decimal)
                 if (!state.writeCfgPages && (pageIdx == 41 || pageIdx == 42 || pageIdx == 43)) {
@@ -742,9 +720,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                     writtenCount++
                     writtenPages[pageIdx] = dataToWrite
                 } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        log("Ошибка записи стр. " + String.format(Locale.ROOT, "%02X", pageIdx) + ": ${e.localizedMessage}")
-                    }
+                    log("Ошибка записи стр. " + String.format(Locale.ROOT, "%02X", pageIdx) + ": ${e.localizedMessage}")
                 }
             }
 
@@ -756,45 +732,37 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 try {
                     connection.magicWakeup()
                     connection.writePage(2, originalPage2Bytes)
-                    withContext(Dispatchers.Main) {
-                        log("Lock-Bait обход: блокировка восстановлена")
-                    }
+                    log("Lock-Bait обход: блокировка восстановлена")
                 } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        log("Внимание: Lock-Bait не восстановлен: ${e.localizedMessage}")
-                    }
+                    log("Внимание: Lock-Bait не восстановлен: ${e.localizedMessage}")
                 }
             }
 
-            _uiState.update { it.copy(operationProgress = 1.0f) }
+            emitProgress(1.0f)
             // Connection is closed in the finally block to avoid a double close.
 
-            withContext(Dispatchers.Main) {
-                log("Запись завершена!")
-                log("Записано страниц: $writtenCount из $totalToWrite")
-                when (verified) {
-                    null -> {
-                        log("⚠️ Верификация не выполнена (не удалось прочитать страницы обратно)")
-                        _uiState.update { it.copy(readTotalPages = "Write completed: $writtenCount/$totalToWrite (не проверено)") }
-                    }
-                    writtenCount -> {
-                        log("✅ Верификация пройдена: все $verified стр. совпадают с дампом")
-                        _uiState.update { it.copy(readTotalPages = "Write OK: $writtenCount/$totalToWrite (verified $verified)") }
-                    }
-                    else -> {
-                        val mismatched = writtenCount - verified
-                        log("❌ Верификация: несовпадений — $mismatched из $writtenCount (подробности выше)")
-                        _uiState.update { it.copy(readTotalPages = "Write MISMATCH: $mismatched/$writtenCount стр.") }
-                    }
+            log("Запись завершена!")
+            log("Записано страниц: $writtenCount из $totalToWrite")
+            when (verified) {
+                null -> {
+                    log("⚠️ Верификация не выполнена (не удалось прочитать страницы обратно)")
+                    _uiState.update { it.copy(readTotalPages = "Write completed: $writtenCount/$totalToWrite (не проверено)") }
+                }
+                writtenCount -> {
+                    log("✅ Верификация пройдена: все $verified стр. совпадают с дампом")
+                    _uiState.update { it.copy(readTotalPages = "Write OK: $writtenCount/$totalToWrite (verified $verified)") }
+                }
+                else -> {
+                    val mismatched = writtenCount - verified
+                    log("❌ Верификация: несовпадений — $mismatched из $writtenCount (подробности выше)")
+                    _uiState.update { it.copy(readTotalPages = "Write MISMATCH: $mismatched/$writtenCount стр.") }
                 }
             }
 
         } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                log("Ошибка подключения: ${e.localizedMessage}")
-            }
+            log("Ошибка подключения: ${e.localizedMessage}")
         } finally {
-            _uiState.update { it.copy(isOperating = false) }
+            finishOperation()
             try {
                 connection.close()
             } catch (ignored: Exception) {}
@@ -815,13 +783,9 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 contentResolver.openOutputStream(uri)?.use { output ->
                     output.write(bytes)
                 }
-                withContext(Dispatchers.Main) {
-                    log("Успешный экспорт дампа: ${max * 4} байт")
-                }
+                log("Успешный экспорт дампа: ${max * 4} байт")
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    log("Ошибка экспорта дампа: ${e.localizedMessage}")
-                }
+                log("Ошибка экспорта дампа: ${e.localizedMessage}")
             }
         }
     }
@@ -833,10 +797,8 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                     val bytes = input.readBytes()
                     val totalBytes = bytes.size
                     if (totalBytes == 0 || totalBytes % 4 != 0) {
-                        withContext(Dispatchers.Main) {
-                            log("Ошибка импорта: размер файла должен быть кратен 4 байтам (получено $totalBytes байт)")
-                        }
-                        return@launch
+                        log("Ошибка импорта: размер файла должен быть кратен 4 байтам (получено $totalBytes байт)")
+                        return@use
                     }
                     val pagesCount = totalBytes / 4
                     val pagesMap = mutableMapOf<Int, String>()
@@ -844,7 +806,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                         val pageBytes = bytes.sliceArray((i * 4) until (i * 4 + 4))
                         pagesMap[i] = bytesToHex(pageBytes)
                     }
-                    
+
                     // Also obtain a 7-byte UID representation from first 2 pages if available
                     val p0 = pagesMap[0] ?: "00000000"
                     val p1 = pagesMap[1] ?: "00000000"
@@ -854,24 +816,20 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                         "00000000000000"
                     }
 
-                    withContext(Dispatchers.Main) {
-                        _uiState.update { state ->
-                            state.copy(
-                                pages = pagesMap,
-                                maxPages = pagesCount,
-                                uid = importedUid,
-                                tagType = if (pagesCount <= 16) "MF0 UL11 (16 стр)" else "EV1/NTAG ($pagesCount стр)",
-                                readTotalPages = "Импортировано из файла: $pagesCount стр."
-                            )
-                        }
-                        log("Успешный импорт дампа: $pagesCount страниц ($totalBytes байт)")
-                        log("Импортирован UID: $importedUid")
+                    _uiState.update { state ->
+                        state.copy(
+                            pages = pagesMap,
+                            maxPages = pagesCount,
+                            uid = importedUid,
+                            tagType = if (pagesCount <= 16) "MF0 UL11 (16 стр)" else "EV1/NTAG ($pagesCount стр)",
+                            readTotalPages = "Импортировано из файла: $pagesCount стр."
+                        )
                     }
+                    log("Успешный импорт дампа: $pagesCount страниц ($totalBytes байт)")
+                    log("Импортирован UID: $importedUid")
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    log("Ошибка импорта дампа: ${e.localizedMessage}")
-                }
+                log("Ошибка импорта дампа: ${e.localizedMessage}")
             }
         }
     }
@@ -883,7 +841,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
      *
      * @return number of pages that matched, or null if no page could be read back at all.
      */
-    private suspend fun verifyWrittenPages(
+    private fun verifyWrittenPages(
         connection: NfcTagConnection,
         writtenPages: Map<Int, ByteArray>
     ): Int? {
@@ -905,9 +863,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 for (offset in 0 until 4) {
                     val pageIdx = blockOffset + offset
                     if (writtenPages.containsKey(pageIdx)) {
-                        withContext(Dispatchers.Main) {
-                            log("Верификация стр. " + String.format(Locale.ROOT, "%02X", pageIdx) + ": не прочитана")
-                        }
+                        log("Верификация стр. " + String.format(Locale.ROOT, "%02X", pageIdx) + ": не прочитана")
                     }
                 }
                 continue
@@ -920,12 +876,10 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
                 if (expected.contentEquals(actual)) {
                     matched++
                 } else {
-                    withContext(Dispatchers.Main) {
-                        log(
-                            "Верификация стр. " + String.format(Locale.ROOT, "%02X", pageIdx) +
-                                ": ожидалось ${bytesToHex(expected)}, прочитано ${bytesToHex(actual)}"
-                        )
-                    }
+                    log(
+                        "Верификация стр. " + String.format(Locale.ROOT, "%02X", pageIdx) +
+                            ": ожидалось ${bytesToHex(expected)}, прочитано ${bytesToHex(actual)}"
+                    )
                 }
             }
         }
