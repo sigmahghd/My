@@ -447,7 +447,7 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun performRead(connection: NfcTagConnection, uidHex: String) {
+    private suspend fun performRead(connection: NfcTagConnection, uidHex: String) {
         startOperation()
         log("Режим: Читать")
         log("Технология: [NfcA / MifareUltralight]")
